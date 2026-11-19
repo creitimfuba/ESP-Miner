@@ -162,6 +162,10 @@ void POWER_MANAGEMENT_init_frequency(GlobalState * GLOBAL_STATE)
 // Grace period after a (re)start: a cold chain ramps for minutes and must never
 // be mistaken for a flatline.
 #define WATCHDOG_WARMUP_S 300
+// Um dominio de hash morto nao derruba o hashrate para zero: ele cai ~25% (1 de
+// 4 no BM1370), o errorPercentage continua em 0 e o painel nao mostra nada.
+// Issue #2004. O monitor ja mede cada dominio; aqui a decisao de reiniciar.
+#define WATCHDOG_DEAD_DOMAIN_S 900
 #define WATCHDOG_MAX_RECOVERIES_PER_HOUR 3
 #define WATCHDOG_MIN_FREQUENCY_MHZ 50.0f
 #define WATCHDOG_HOUR_US (3600LL * 1000000LL)
@@ -173,6 +177,7 @@ typedef struct
     int64_t hashrate_since_us;
     uint64_t last_share_count;
     int64_t shares_since_us;
+    int64_t dead_domain_since_us;   // inicio do dominio morto (0 = nenhum)
     int64_t recovery_us[WATCHDOG_MAX_RECOVERIES_PER_HOUR];
     int recovery_count;
 } mining_watchdog_t;
@@ -214,6 +219,50 @@ static void watchdog_reset_signals(mining_watchdog_t * wd, const SystemModule * 
     wd->hashrate_since_us = now_us;
     wd->last_share_count = watchdog_share_count(sys_module);
     wd->shares_since_us = now_us;
+    wd->dead_domain_since_us = 0;
+}
+
+// (c) Um dominio de hash morto. Nao aparece como flatline porque o hashrate
+// total continua em ~75% e errorPercentage fica em 0 — o painel mostra tudo
+// normal enquanto 25% da placa esta parada (issue #2004). So conta como morto
+// quando ALGUM dominio ainda entrega: cadeia inteira em zero e outro assunto
+// (flatline/no-share), e um self-test ou ramp-up nao devem disparar isto.
+static bool watchdog_has_dead_domain(GlobalState * GLOBAL_STATE, mining_watchdog_t * wd,
+                                     int64_t now_us)
+{
+    const AsicConfig * asic = &GLOBAL_STATE->DEVICE_CONFIG.family.asic;
+    int domains = asic->hash_domains;
+    if (domains < 2) {
+        return false;   // sem redundancia para comparar
+    }
+
+    int alive = 0;
+    int dead = 0;
+    for (int d = 0; d < domains; d++) {
+        asic_domain_measurement_t m;
+        if (ASIC_get_domain_measurement(GLOBAL_STATE, 0, d, &m) != ESP_OK) {
+            return false;   // leitura indisponivel: nao decide nada
+        }
+        if (m.hashrate > 0.0f) {
+            alive++;
+        } else {
+            dead++;
+        }
+    }
+
+    if (dead == 0 || alive == 0) {
+        wd->dead_domain_since_us = 0;
+        return false;
+    }
+
+    if (wd->dead_domain_since_us == 0) {
+        wd->dead_domain_since_us = now_us;
+        ESP_LOGW(TAG, "Watchdog: %d de %d dominios de hash em zero; observando por %ds",
+                 dead, domains, WATCHDOG_DEAD_DOMAIN_S);
+        return false;
+    }
+
+    return now_us - wd->dead_domain_since_us >= (int64_t) WATCHDOG_DEAD_DOMAIN_S * 1000000LL;
 }
 
 static void watchdog_tick(mining_watchdog_t * wd, GlobalState * GLOBAL_STATE, bool is_paused)
@@ -245,8 +294,11 @@ static void watchdog_tick(mining_watchdog_t * wd, GlobalState * GLOBAL_STATE, bo
         now_us - wd->hashrate_since_us >= (int64_t) WATCHDOG_HASHRATE_FLATLINE_S * 1000000LL;
     bool no_shares =
         now_us - wd->shares_since_us >= (int64_t) WATCHDOG_NO_SHARE_S * 1000000LL;
+    bool dead_domain = watchdog_has_dead_domain(GLOBAL_STATE, wd, now_us);
 
-    const char *reason = hashrate_flat ? "hashrate_1m frozen" : (no_shares ? "no new shares" : NULL);
+    const char *reason = hashrate_flat ? "hashrate_1m frozen"
+                       : (no_shares      ? "no new shares"
+                       : (dead_domain    ? "hash domain stuck at zero" : NULL));
     if (reason == NULL) {
         return;
     }
