@@ -531,9 +531,24 @@ esp_err_t TPS546_init(TPS546_CONFIG config)
     ESP_LOGI(TAG, "Device ID: %02x %02x %02x %02x %02x %02x", id[0], id[1], id[2], id[3], id[4], id[5]);
 
     if (!id_matched) {
-
-        ESP_LOGE(TAG, "Cannot find TPS546 regulator - Device ID mismatch");
-        return ESP_FAIL;
+        // Um ID nao reconhecido nao prova que o regulador esta ausente.
+        // Revisoes novas de silicio e unidades de reposicao reportam IDs
+        // diferentes do D24A/D24S (issue #1886: 54 49 54 60 00 00). Abortar
+        // aqui deixa a placa sem tensao alguma — pior que tentar configurar.
+        // So e falha real quando o barramento nao devolveu NADA.
+        bool respondeu = false;
+        for (int i = 0; i < 6; i++) {
+            if (id[i] != 0x00 && id[i] != 0xFF) {
+                respondeu = true;
+                break;
+            }
+        }
+        if (!respondeu) {
+            ESP_LOGE(TAG, "TPS546 nao respondeu no barramento - Device ID vazio");
+            return ESP_FAIL;
+        }
+        ESP_LOGW(TAG, "TPS546 com Device ID nao reconhecido (%02x %02x %02x %02x %02x %02x) - seguindo com a configuracao",
+                 id[0], id[1], id[2], id[3], id[4], id[5]);
     }
 
     //write operation register to turn off power

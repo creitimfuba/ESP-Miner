@@ -20,6 +20,15 @@
 static const char * TAG = "fan_controller";
 static const char * prev_context = "";
 
+// Uma leitura/escrita I2C que falha uma vez nao e prova de falha de hardware:
+// ruido no barramento acontece. Marcar hardware_fault na primeira tentativa
+// para a mineracao inteira e nao existe caminho de volta (a flag nunca e
+// limpa em lugar nenhum), entao o aparelho fica parado ate alguem reiniciar
+// na mao. Issue #2079: "Fan Control Failed (Auto)", temp e tensao em 0.
+#define FAN_WRITE_ATTEMPTS 3
+#define FAN_FAIL_LIMIT     3
+static int fan_fail_streak = 0;
+
 static void update_fan_speed(GlobalState * GLOBAL_STATE, float target_perc, const char * context)
 {
     if (target_perc > 100.0f) target_perc = 100.0f;
@@ -36,10 +45,35 @@ static void update_fan_speed(GlobalState * GLOBAL_STATE, float target_perc, cons
     }
     if (target_changed) {
         GLOBAL_STATE->POWER_MANAGEMENT_MODULE.fan_perc = target_perc;
-        if (Thermal_set_fan_percent(&GLOBAL_STATE->DEVICE_CONFIG, target_perc / 100.0f) != ESP_OK) {
-            ESP_LOGE(TAG, "FATAL: Fan Control Failed (%s). Flagging hardware fault.", context);
-            GLOBAL_STATE->SYSTEM_MODULE.hardware_fault = true;
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg, sizeof(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg), "Fan Control Failed (%s)", context);
+
+        // Retry antes de concluir que o controle falhou.
+        esp_err_t err = ESP_FAIL;
+        for (int attempt = 0; attempt < FAN_WRITE_ATTEMPTS; attempt++) {
+            err = Thermal_set_fan_percent(&GLOBAL_STATE->DEVICE_CONFIG, target_perc / 100.0f);
+            if (err == ESP_OK) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        if (err != ESP_OK) {
+            fan_fail_streak++;
+            ESP_LOGW(TAG, "Falha ao ajustar o fan (%s): %d/%d", context, fan_fail_streak, FAN_FAIL_LIMIT);
+            if (fan_fail_streak >= FAN_FAIL_LIMIT) {
+                ESP_LOGE(TAG, "FATAL: Fan Control Failed (%s). Flagging hardware fault.", context);
+                GLOBAL_STATE->SYSTEM_MODULE.hardware_fault = true;
+                snprintf(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg, sizeof(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg), "Fan Control Failed (%s)", context);
+            }
+        } else if (fan_fail_streak > 0) {
+            fan_fail_streak = 0;
+            // Recuperou: se o fault foi aberto por causa do fan, ele pode sair.
+            // Faults de outra origem continuam intactos.
+            if (GLOBAL_STATE->SYSTEM_MODULE.hardware_fault
+                && strstr(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg, "Fan Control") != NULL) {
+                GLOBAL_STATE->SYSTEM_MODULE.hardware_fault = false;
+                GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg[0] = '\0';
+                ESP_LOGW(TAG, "Controle do fan recuperado — limpando o hardware fault");
+            }
         }
     }
 }
